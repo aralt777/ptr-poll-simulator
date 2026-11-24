@@ -222,10 +222,104 @@ def build_government_opposition_summary(
     for label, values in (("Government", gov_values), ("Opposition", opposition_values)):
         rows.append({
             "Side": label,
-            "Median seats": int(np.floor(np.median(values) + 0.5)),
-            "90% CI range": f"{np.percentile(values, 5):.0f}–{np.percentile(values, 95):.0f}",
-            "Chance of majority": f"{100 * np.mean(values >= majority):.1f}%",
+            "Median": int(np.floor(np.median(values) + 0.5)),
+            "90% CI": f"{np.percentile(values, 5):.0f}–{np.percentile(values, 95):.0f}",
+            "Majority %": f"{100 * np.mean(values >= majority):.1f}%",
         })
+    return pd.DataFrame(rows)
+
+
+def coalition_seat_values(national_runs: list[dict[int, int]],
+                          coalition_party_ids: set[int]) -> np.ndarray:
+    return np.asarray([
+        sum(int(seats) for pid, seats in result.items() if int(pid) in coalition_party_ids)
+        for result in national_runs
+    ], dtype=int)
+
+
+def build_coalition_summary(national_runs: list[dict[int, int]],
+                            coalition_party_ids: set[int],
+                            total_seats: int) -> pd.DataFrame:
+    if not national_runs:
+        return pd.DataFrame()
+    values = coalition_seat_values(national_runs, coalition_party_ids)
+    majority = int(total_seats) // 2 + 1
+    return pd.DataFrame([{
+        "Coalition": "Custom coalition",
+        "Median": int(np.floor(np.median(values) + 0.5)),
+        "90% CI": f"{np.percentile(values, 5):.0f}–{np.percentile(values, 95):.0f}",
+        "Majority %": f"{100 * np.mean(values >= majority):.1f}%",
+    }])
+
+
+def seat_distribution_chart(values: np.ndarray, title: str):
+    values = values[np.isfinite(values)].astype(int)
+    if not values.size:
+        st.warning("No seat distribution data is available.")
+        return
+    histogram = pd.DataFrame({"Seats": values})
+    spread = int(values.max() - values.min() + 1)
+    fig = px.histogram(
+        histogram,
+        x="Seats",
+        nbins=min(60, max(1, spread)),
+        title=title,
+        labels={"count": "Simulations", "Seats": "Seats"},
+        color_discrete_sequence=["#4C78A8"],
+    )
+    fig.update_layout(showlegend=False, bargap=0.04)
+    st.plotly_chart(fig, width="stretch")
+
+
+def largest_party_pie(national_runs: list[dict[int, int]],
+                      parties: list[dict]) -> pd.DataFrame:
+    if not national_runs:
+        return pd.DataFrame()
+
+    outright = {int(party["party_id"]): 0 for party in parties}
+    tied = 0
+    party_names = {
+        int(party["party_id"]):
+            party.get("party_name") or party.get("name")
+            or party.get("abbreviation") or str(party["party_id"])
+        for party in parties
+    }
+    party_colors = {}
+    for party in parties:
+        pid = int(party["party_id"])
+        party_name = party_names[pid]
+        colour = party.get("color")
+        party_colors[party_name] = (
+            str(colour) if isinstance(colour, str) and re.fullmatch(r"#[0-9A-Fa-f]{6}", colour)
+            else "#4C78A8"
+        )
+
+    for result in national_runs:
+        largest = max((int(result.get(pid, 0)) for pid in outright), default=0)
+        leaders = [pid for pid in outright if int(result.get(pid, 0)) == largest]
+        if len(leaders) == 1:
+            outright[leaders[0]] += 1
+        else:
+            tied += 1
+
+    rows = [
+        {
+            "Party": party_names[pid],
+            "Chance": count / len(national_runs),
+            "Colour": party_colors[party_names[pid]],
+        }
+        for pid, count in outright.items()
+        if count
+    ]
+    if tied:
+        rows.append({
+            "Party": "Tied",
+            "Chance": tied / len(national_runs),
+            "Colour": "#808080",
+        })
+        party_colors["Tied"] = "#808080"
+    for row in rows:
+        row["Party"] = str(row["Party"])
     return pd.DataFrame(rows)
 
 # -------------------------- Monte Carlo maths ----------------------------
@@ -860,11 +954,94 @@ if saved and saved.get("nation_id") == selected_nation_id:
             national_runs, government_party_ids, int(poll.get("total_seats", 0) or 0)
         )
         if not gov_summary.empty:
-            st.dataframe(gov_summary, hide_index=True, width="stretch")
+            st.dataframe(
+                gov_summary,
+                hide_index=True,
+                width=520,
+                column_config={
+                    "Side": st.column_config.TextColumn(width="small"),
+                    "Median": st.column_config.NumberColumn(width="small"),
+                    "90% CI": st.column_config.TextColumn(width="small"),
+                    "Majority %": st.column_config.TextColumn(width="small"),
+                },
+            )
+            government_values = coalition_seat_values(national_runs, government_party_ids)
+            opposition_values = coalition_seat_values(
+                national_runs,
+                set(national_party_meta) - government_party_ids,
+            )
+            with st.expander("Government and opposition distributions"):
+                col_gov, col_opp = st.columns(2)
+                with col_gov:
+                    seat_distribution_chart(government_values, "Government seat distribution")
+                with col_opp:
+                    seat_distribution_chart(opposition_values, "Opposition seat distribution")
         else:
             st.info("Government seat totals could not be calculated.")
     else:
         st.warning("The government endpoint did not provide a usable current government or serving party membership.")
+
+    with st.expander("Largest party chance"):
+        largest_party_frame = largest_party_pie(national_runs, parties)
+        if largest_party_frame.empty:
+            st.info("No largest-party data is available.")
+        else:
+            pie = px.pie(
+                largest_party_frame,
+                names="Party",
+                values="Chance",
+                color="Party",
+                color_discrete_map={
+                    str(row["Party"]): str(row["Colour"])
+                    for _, row in largest_party_frame.iterrows()
+                },
+                hole=0.35,
+            )
+            pie.update_traces(textinfo="label+percent")
+            pie.update_layout(showlegend=True)
+            st.plotly_chart(pie, width="stretch")
+
+    with st.expander("Custom coalition"):
+        party_options = {
+            int(party["party_id"]):
+                party.get("party_name") or party.get("name")
+                or party.get("abbreviation") or str(party["party_id"])
+            for party in parties
+        }
+        coalition_name = st.text_input(
+            "Coalition name",
+            value="My coalition",
+            key=f"coalition_name_{selected_nation_id}_{poll_id}",
+        )
+        coalition_ids = st.multiselect(
+            "Coalition parties",
+            list(party_options),
+            format_func=lambda pid: f"{party_options[pid]} · {pid}",
+            key=f"coalition_ids_{selected_nation_id}_{poll_id}",
+        )
+        if coalition_ids:
+            coalition_party_ids = set(coalition_ids)
+            coalition_summary = build_coalition_summary(
+                national_runs,
+                coalition_party_ids,
+                int(poll.get("total_seats", 0) or 0),
+            )
+            coalition_summary["Coalition"] = coalition_name.strip() or "Custom coalition"
+            st.dataframe(
+                coalition_summary,
+                hide_index=True,
+                width=520,
+                column_config={
+                    "Coalition": st.column_config.TextColumn(width="medium"),
+                    "Median": st.column_config.NumberColumn(width="small"),
+                    "90% CI": st.column_config.TextColumn(width="small"),
+                    "Majority %": st.column_config.TextColumn(width="small"),
+                },
+            )
+            coalition_values = coalition_seat_values(national_runs, coalition_party_ids)
+            seat_distribution_chart(coalition_values, f"{coalition_summary.at[0, 'Coalition']} seat distribution")
+        else:
+            st.info("Select one or more parties to calculate a custom coalition.")
 
     tabs = st.tabs(["National results"] + list(region_runs.keys()))
     scopes = [("National results", national_runs)] + list(region_runs.items())
