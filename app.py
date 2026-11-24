@@ -81,6 +81,49 @@ def get_provision_value(provisions: dict, key: str, default=None):
         return value
 
 
+def get_discrete_provision(constitution: dict, key: str, default: str = "") -> str:
+    for provision in constitution.get("provisions", []):
+        if provision.get("system_parameter_key") == key:
+            value_name = provision.get("current_value_name")
+            if value_name:
+                return str(value_name)
+            current_value = provision.get("current_value")
+            for value in provision.get("values", []):
+                if str(value.get("id")) == str(current_value):
+                    resolved_name = value.get("name")
+                    if resolved_name:
+                        return str(resolved_name)
+            return str(current_value or default)
+    return default
+
+
+def derive_electoral_mode(constitution: dict, poll: dict) -> str:
+    apportionment = get_discrete_provision(
+        constitution, "regional_apportionment",
+        str(poll.get("allocation_method") or "")
+    ).lower()
+    threshold_scope = get_discrete_provision(
+        constitution, "regional_threshold_scope", ""
+    ).lower()
+
+    if "national" in apportionment:
+        return "National pool"
+    if "whole" in threshold_scope or "nation" in threshold_scope:
+        return "Regional allocation, national threshold"
+    return "District threshold"
+
+
+def derive_allocation_algorithm(constitution: dict) -> str:
+    algorithm = get_discrete_provision(
+        constitution, "seat_allocation_algorithm", "Sainte-Lague"
+    ).lower()
+    if "d'hondt" in algorithm or "dhondt" in algorithm or algorithm.strip() == "9":
+        return "D'Hondt"
+    if "hare" in algorithm or "largest remainder" in algorithm or algorithm.strip() == "11":
+        return "Hare-largest remainder"
+    return "Sainte-Lague"
+
+
 
 
 def government_records(payload: dict | list) -> list[dict]:
@@ -256,6 +299,72 @@ def allocate_sainte_lague(votes: dict[str, float], seats: int,
     return allocation
 
 
+def allocate_dhondt(votes: dict[str, float], seats: int,
+                    eligible: set[str] | None = None) -> dict[str, int]:
+    """Allocate seats using D'Hondt divisors 1, 2, 3, ..."""
+    allocation = {key: 0 for key in votes}
+    if seats <= 0:
+        return allocation
+
+    candidates = [
+        key for key, value in votes.items()
+        if value > 0 and (eligible is None or key in eligible)
+    ]
+    for _ in range(seats):
+        if not candidates:
+            break
+        winner = max(candidates, key=lambda key: votes[key] / (allocation[key] + 1))
+        allocation[winner] += 1
+    return allocation
+
+
+def allocate_hare_largest_remainder(votes: dict[str, float], seats: int,
+                                    eligible: set[str] | None = None) -> dict[str, int]:
+    """Allocate seats using the Hare quota and largest remainders."""
+    allocation = {key: 0 for key in votes}
+    if seats <= 0:
+        return allocation
+
+    candidates = [
+        key for key, value in votes.items()
+        if value > 0 and (eligible is None or key in eligible)
+    ]
+    if not candidates:
+        return allocation
+
+    total_votes = sum(votes[key] for key in candidates)
+    if total_votes <= 0:
+        return allocation
+
+    quota = total_votes / seats
+    exact = {key: votes[key] / quota for key in candidates}
+    for key in candidates:
+        allocation[key] = math.floor(exact[key])
+
+    remainder = seats - sum(allocation.values())
+    if remainder <= 0:
+        return allocation
+
+    order = sorted(
+        candidates,
+        key=lambda key: (exact[key] - math.floor(exact[key]), key),
+        reverse=True,
+    )
+    for key in order[:remainder]:
+        allocation[key] += 1
+    return allocation
+
+
+def allocate_seats(votes: dict[str, float], seats: int,
+                   eligible: set[str] | None,
+                   algorithm: str) -> dict[str, int]:
+    if algorithm == "D'Hondt":
+        return allocate_dhondt(votes, seats, eligible)
+    if algorithm == "Hare-largest remainder":
+        return allocate_hare_largest_remainder(votes, seats, eligible)
+    return allocate_sainte_lague(votes, seats, eligible)
+
+
 def threshold_eligible(votes: dict[str, float], parties: list[dict],
                        joint_lists: dict[int, dict], threshold: float,
                        list_threshold: float | None = None) -> set[str]:
@@ -340,6 +449,7 @@ def party_groups(sampled: dict[int, float], party_meta: dict[int, dict],
 
 def simulate_once(poll: dict, constitution: dict, joint_lists: dict[int, dict],
                   mode: str, threshold: float, list_threshold: float | None,
+                  allocation_algorithm: str,
                   rng: np.random.Generator) -> tuple[dict[int, int], dict[str, dict[int, int]]]:
     parties = poll.get("parties", [])
     meta = poll_parties_by_id(poll)
@@ -351,7 +461,9 @@ def simulate_once(poll: dict, constitution: dict, joint_lists: dict[int, dict],
         sampled = sample_vote_shares(parties, rng)
         grouped = party_groups(sampled, meta, joint_lists)
         eligible = threshold_eligible(grouped, parties, joint_lists, threshold, list_threshold)
-        group_seats = allocate_sainte_lague(grouped, int(poll.get("total_seats", 0)), eligible)
+        group_seats = allocate_seats(
+            grouped, int(poll.get("total_seats", 0)), eligible, allocation_algorithm
+        )
         national_result = distribute_group_seats(group_seats, sampled, parties, joint_lists)
         region_result["National"] = national_result.copy()
         return national_result, region_result
@@ -409,7 +521,7 @@ def simulate_once(poll: dict, constitution: dict, joint_lists: dict[int, dict],
             # Last-resort fallback only; prefer the constitution's apportionment.
             seats = sum(int(x.get("projected_seats", 0) or 0) for x in district_party_rows)
 
-        group_seats = allocate_sainte_lague(grouped, seats, eligible)
+        group_seats = allocate_seats(grouped, seats, eligible, allocation_algorithm)
         local_party_seats = distribute_group_seats(
             group_seats, district_sample, district_meta, joint_lists
         )
@@ -565,13 +677,6 @@ with st.sidebar:
     st.header("Simulation settings")
     simulations = st.number_input("Number of simulations", min_value=100, max_value=100000,
                                   value=10000, step=1000)
-    mode = st.selectbox(
-        "Electoral allocation method",
-        ["District threshold", "Regional allocation, national threshold", "National pool"],
-        help=("District threshold: district seats and district threshold. "
-              "Regional allocation, national threshold: district seats but national threshold. "
-              "National pool: all seats allocated nationally.")
-    )
     st.caption("The confidence interval shown in the results is the central 90% simulation interval.")
 
 nation_base = f"{API_BASE}/{selected_nation_id}"
@@ -660,6 +765,8 @@ if run:
     threshold = get_provision_value(provisions, "electoral_threshold_pct", poll.get("threshold_pct", 5))
     if threshold is None:
         threshold = float(poll.get("threshold_pct", 5) or 5)
+    mode = derive_electoral_mode(constitution, poll)
+    allocation_algorithm = derive_allocation_algorithm(constitution)
     list_threshold = get_provision_value(
         provisions, "coalition_threshold_pct", poll.get("coalition_threshold_pct")
     )
@@ -685,7 +792,8 @@ if run:
     st.write(
         f"**Poll:** {poll_id} · **Game month:** {poll_month} · "
         f"**Seats:** {poll.get('total_seats', 'unknown')} · "
-        f"**Allocation:** {poll.get('allocation_method', 'unknown')}"
+        f"**Constitutional allocation:** {mode} · "
+        f"**Seat algorithm:** {allocation_algorithm}"
     )
     st.write(f"**Threshold:** {threshold:g}% · **Joint-list threshold:** "
              f"{'same as national threshold' if list_threshold is None else f'{list_threshold:g}%'}")
@@ -698,7 +806,8 @@ if run:
     progress = st.progress(0, text="Simulating seat allocations...")
     for i in range(int(simulations)):
         national, regions = simulate_once(
-            poll, constitution, joint_lists, mode, float(threshold), list_threshold, rng
+            poll, constitution, joint_lists, mode, float(threshold), list_threshold,
+            allocation_algorithm, rng
         )
         national_runs.append(national)
         for region_name, result in regions.items():
@@ -714,6 +823,7 @@ if run:
         "poll_id": poll_id,
         "nation_id": selected_nation_id,
         "mode": mode,
+        "allocation_algorithm": allocation_algorithm,
         "simulations": int(simulations),
         "government": government,
         "government_party_ids": sorted(government_party_ids),
@@ -725,6 +835,8 @@ if saved and saved.get("nation_id") == selected_nation_id:
     national_runs = saved["national_runs"]
     region_runs = saved["region_runs"]
     poll_id = saved["poll_id"]
+    allocation_algorithm = saved.get("allocation_algorithm", "Sainte-Lague")
+    mode = saved.get("mode", "District threshold")
     parties = poll.get("parties", [])
     national_party_meta = {int(p["party_id"]): p for p in parties}
     district_parties_by_name = {
@@ -806,13 +918,15 @@ if saved and saved.get("nation_id") == selected_nation_id:
             )
 
     with st.expander("Simulation assumptions and limitations"):
-        st.markdown("""
+        st.markdown(f"""
 - Each party's poll estimate is sampled from a normal distribution with standard deviation `MOE / 1.96`.
 - Negative draws are rejected, then all sampled party shares in the relevant pool are normalised to 100%.
 - District simulations use district-level poll estimates and MOEs.
 - District seat counts come from the constitution's `apportionment` array.
 - Thresholds are applied to standalone parties or pooled qualifying joint lists.
-- Sainte-Laguë uses odd divisors (1, 3, 5, ...).
+- Constitutional allocation mode: **{mode}**.
+- Seat allocation algorithm: **{allocation_algorithm}**.
+- Sainte-Laguë uses odd divisors (1, 3, 5, ...); D'Hondt uses divisors (1, 2, 3, ...); Hare-largest remainder uses the Hare quota and largest remainders.
 - Joint-list seats are split by each member party's `ratio_pct` in the active joint-list data. Ratios are renormalised over only the member parties running in the relevant district, then whole seats are assigned by the largest-remainder method.
 - The API's poll-level `projected_seats_with_threshold` is shown as `PollSeats`; it is not used to force the simulation toward the API projection.
 - Chance largest party counts simulations in which a party outright holds the most seats.
